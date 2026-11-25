@@ -1,59 +1,113 @@
 # Self-hosting HumanLayer on Railway
 
-This folder holds what we added to run the HumanLayer backend on [Railway](https://railway.com) instead of AWS. The official reference (`.claude/skills/self-host-humanlayer/`) targets AWS with Pulumi; this is a smaller setup for a small team.
+HumanLayer's official self-host reference (`.claude/skills/self-host-humanlayer/`) targets AWS with Pulumi. This folder is what we used to run the same code on [Railway](https://railway.com) for a small team: no AWS account, no Pulumi, one Railway project.
 
-**Status: work in progress.** The table below says what has been run and what has not. Nothing here is supported by HumanLayer.
+It is a record of a working setup, not a supported installer. Nothing here is endorsed by HumanLayer.
 
-| Part | Status |
-|---|---|
-| Postgres 18, Redis, Electric, durable streams | Running on Railway |
-| Migrations and cleanup jobs (`jobs` service) | Running |
-| API (`api` service) | Boots and passes its health check with placeholder third-party values |
-| Sync proxy (`sync` service) | Boots with real WorkOS values; not yet tested with a real login |
-| Web apps (`app`, `admin` services) | Built and deployed; not yet tested in a browser |
-| Bucket CORS for browser uploads | Rule set and preflight checked; no real upload yet |
-| End-to-end WorkOS login, CLI and daemon builds | Not done yet |
+## What works
+
+Verified on our deployment (staging and production, upstream release 0.203.0):
+
+- Login through WorkOS AuthKit, organization creation, and live sync in the web app
+- A daemon on a developer's Mac connecting, cloning a repo, and running an agent session end to end
+- Server-side titles and summaries through OpenRouter
+- Deploys from GitHub on push, with a separate branch per environment
+- Scheduled Postgres volume backups
+
+Not set up or not tested here: the desktop apps, a real GitHub App (pull request status), Slack/Linear/Jira, Stripe billing, Resend onboarding email, restoring from a backup.
+
+## What you need
+
+- A Railway account
+- A WorkOS account (required: all login goes through it)
+- A domain you can add DNS records to
+- Bun, to build the CLI
+- Optional: an OpenRouter or Anthropic key for titles and summaries
 
 ## Files here
 
-- `jobs.Dockerfile`, `jobs.sh`: one container that runs database migrations on start, then the stale-daemon sweeper every minute and database maintenance once a day. It replaces the three AWS Lambdas (`riptide-migrator`, `stale-daemon-sweeper`, `database-maintenance-function`). Railway cron cannot run more often than every 5 minutes, so the sweeper runs in a loop.
-- `build-web.sh`, `web.Dockerfile`, `web.Caddyfile`: build `riptide-ui` and `riptide-cloud` locally with your origins baked in, and stage each as a small Caddy static site (single-page-app fallback) for `railway up <folder> --path-as-root --no-gitignore`.
-- `api.Dockerfile`, `sync.Dockerfile`: copies of `apps/riptide-api/Dockerfile` and `apps/riptide-electric-proxy/Dockerfile` without the Sentry source-map stage. Railway rejects BuildKit `--mount=type=secret`.
+| File | Purpose |
+|---|---|
+| `api.Dockerfile`, `sync.Dockerfile` | `apps/riptide-api` and `apps/riptide-electric-proxy` without the Sentry source-map stage. Railway rejects BuildKit `--mount=type=secret`. |
+| `jobs.Dockerfile`, `jobs.sh` | One container that runs database migrations on start, then the stale-daemon sweeper every minute and database maintenance once a day. Replaces three AWS Lambdas. Railway cron cannot run more often than every 5 minutes, so the sweeper loops. |
+| `web.Dockerfile`, `web.Caddyfile` | Builds `riptide-ui` or `riptide-cloud` and serves it with Caddy as a single-page app. |
+| `build-web.sh` | Builds the two web apps locally instead, if you prefer to upload prebuilt sites. |
+| `build-cli.sh` | Builds the CLI and daemon against your own hostnames. |
 
-The jobs, api and sync Dockerfiles build with the **monorepo root** as the build context. Point a Railway service at one by setting the `RAILWAY_DOCKERFILE_PATH` variable, for example `selfhost/api.Dockerfile`.
+Every Dockerfile uses the **monorepo root** as its build context. Point a Railway service at one with the `RAILWAY_DOCKERFILE_PATH` variable.
+
+## Code changes in this fork
+
+Three small behaviours, each switched on by an environment variable and off by default:
+
+- **`OPENROUTER_API_KEY`** routes server-side inference through OpenRouter (`packages/ai/src/providers/primary-models.ts`).
+- **`IS_BILLING_ENFORCEMENT_ENABLED=false`** now also skips Stripe when an organization is created. Upstream calls Stripe unconditionally, which fails without a real Stripe account.
+- **`ALLOWED_EMAIL_DOMAINS`** limits who can create organizations and who can be invited.
+
+## Hostnames
+
+Pick a base name and a domain. We used flat names so one certificate level is enough:
+
+| Purpose | Hostname | Service |
+|---|---|---|
+| Main app | `<base>.<domain>` | `app` |
+| Admin app | `<base>-admin.<domain>` | `admin` |
+| API | `<base>-api.<domain>` | `api` |
+| Sync | `<base>-sync.<domain>` | `sync` |
+
+Add each as a custom domain on its Railway service, then create the CNAME and `_railway-verify` TXT records Railway gives you. On Cloudflare, set the CNAMEs to DNS only.
+
+These hostnames and the WorkOS client ID are baked into the web apps and the CLI at build time. Changing them later means rebuilding.
 
 ## Services
 
 | Service | Source | Port | Volume | Public |
 |---|---|---|---|---|
 | `postgres` | image `postgres:18` | 5432 | `/var/lib/postgresql` | no |
-| `Redis` | Railway Redis | 6379 | (managed) | no |
+| `Redis` | Railway Redis | 6379 | managed | no |
 | `electric` | image `electricsql/electric:1.7.12` | 3000 | `/var/lib/electric` | no |
-| `durable-streams` | `docker/durable-streams-server/Dockerfile` | 4437 | `/var/lib/durable-streams` | no |
+| `durable-streams` | `docker/durable-streams-server` | 4437 | `/var/lib/durable-streams` | no |
 | `jobs` | `selfhost/jobs.Dockerfile` | none | none | no |
 | `api` | `selfhost/api.Dockerfile` | 8700 | none | yes |
 | `sync` | `selfhost/sync.Dockerfile` | 8888 | none | yes |
+| `app` | `selfhost/web.Dockerfile` | 8080 | none | yes |
+| `admin` | `selfhost/web.Dockerfile` | 8080 | none | yes |
 | artifacts | Railway bucket | | | S3 endpoint |
 
-Run exactly one `electric` and one `durable-streams` instance. A Railway service with a volume cannot have replicas, which enforces this.
+Run exactly one `electric` and one `durable-streams`. A Railway service with a volume cannot have replicas, which enforces this.
 
-## Setup notes
+## Setup, in order
 
-### Postgres
+### 1. Postgres
 
-Postgres must be version 18 (the migrations use `uuidv7()`), and Electric needs logical replication. Start command:
+Version 18 is required (the migrations use `uuidv7()`), and Electric needs logical replication. Use the plain `postgres:18` image with a volume at `/var/lib/postgresql` and this start command:
 
 ```
 docker-entrypoint.sh postgres -c wal_level=logical -c listen_addresses=* -c max_slot_wal_keep_size=10240 -c max_connections=200
 ```
 
-Variables: `POSTGRES_DB=electric`, `POSTGRES_USER=postgres`, `POSTGRES_PASSWORD=<random>`, and for other services to reference:
+Variables:
 
 ```
+POSTGRES_DB=electric
+POSTGRES_USER=postgres
+POSTGRES_PASSWORD=<random>
 DATABASE_URL=postgresql://postgres:${{POSTGRES_PASSWORD}}@${{RAILWAY_PRIVATE_DOMAIN}}:5432/electric?sslmode=disable
 ```
 
-### Electric
+Then turn on backups:
+
+```bash
+railway postgres pitr schedule set --daily --weekly --monthly --service postgres
+```
+
+These are volume snapshots. We have not yet done a test restore.
+
+### 2. Redis
+
+Add Railway's Redis. Plain standalone mode works.
+
+### 3. Electric
 
 ```
 DATABASE_URL=${{postgres.DATABASE_URL}}
@@ -69,9 +123,9 @@ ELECTRIC_SHAPE_SUSPEND_CONSUMER=true
 PORT=3000
 ```
 
-### Durable streams
+### 4. Durable streams
 
-Deploy `docker/durable-streams-server` as the service root. It builds a pinned commit of a third-party repo, so keep a mirror of that repo if you depend on this.
+Deploy `docker/durable-streams-server` as the service root, with a volume at `/var/lib/durable-streams`. It builds a pinned commit of a third-party repository, so mirror that repository if you depend on this.
 
 ```
 DS_SERVER__BIND_ADDRESS=[::]:4437
@@ -84,18 +138,51 @@ RAILWAY_RUN_UID=0
 PORT=4437
 ```
 
-### Jobs
+### 5. Jobs
 
 ```
 DATABASE_URL=${{postgres.DATABASE_URL}}
 RAILWAY_DOCKERFILE_PATH=selfhost/jobs.Dockerfile
 ```
 
-Redeploy `jobs` whenever you pull new migrations, before you redeploy `api`.
+It applies migrations each time it starts. Let it finish before the API starts on a new schema.
 
-### API
+### 6. Artifacts bucket
 
-Core settings:
+Create a Railway bucket, then give it a CORS rule, because browsers upload to it directly:
+
+```bash
+aws s3api put-bucket-cors --endpoint-url <bucket endpoint> --bucket <bucket name> --cors-configuration '{
+  "CORSRules": [{
+    "AllowedOrigins": ["https://<base>.<domain>", "https://<base>-admin.<domain>"],
+    "AllowedMethods": ["GET", "PUT", "HEAD"],
+    "AllowedHeaders": ["*"],
+    "ExposeHeaders": ["ETag"],
+    "MaxAgeSeconds": 3600
+  }]
+}'
+```
+
+### 7. WorkOS
+
+Use a dedicated WorkOS environment per deployment.
+
+- **Roles:** `admin`, `manager` and `member`. `admin` and `member` exist by default; add `manager`.
+- **JWT template** (required). The sync proxy rejects any token without this claim:
+
+  ```
+  {
+    "internal_org_id": {{organization.metadata.internal_org_id}}
+  }
+  ```
+
+  It can be set with `PUT https://api.workos.com/user_management/jwt_template` and a body of `{"content": "<template>"}`.
+- **Redirect URIs:** `https://<base>.<domain>/auth/callback`, `https://<base>.<domain>` and `https://<base>-admin.<domain>/auth/callback`.
+- **CORS origins:** `https://<base>.<domain>` and `https://<base>-admin.<domain>`.
+- **Sign-in methods:** a new production environment has every method off except SSO. Turn on what you want. Google in production needs your own Google OAuth client; a Google Workspace "Internal" client limits sign-in to your domain.
+- **Webhook** (optional): `https://<base>-api.<domain>/webhooks/workos` for `organization_membership.*`, with its secret in `WORKOS_WEBHOOK_SECRET`.
+
+### 8. API
 
 ```
 RAILWAY_DOCKERFILE_PATH=selfhost/api.Dockerfile
@@ -103,19 +190,19 @@ NODE_ENV=production
 STAGE=prod
 PORT=8700
 DATABASE_URL=${{postgres.DATABASE_URL}}
-READ_REPLICA_DATABASE_URL=${{postgres.DATABASE_URL}}     # required; no replica, so same database
+READ_REPLICA_DATABASE_URL=${{postgres.DATABASE_URL}}     # required; point it at the same database
 KV_URL=${{Redis.REDIS_URL}}
 REDIS_CLIENT_MODE=standalone
 DURABLE_STREAMS_ORIGIN=http://${{durable-streams.RAILWAY_PRIVATE_DOMAIN}}:4437
 IS_BILLING_ENFORCEMENT_ENABLED=false
 BLOCK_NEW_ORG_CREATION=false
 ONBOARDING_CAMPAIGN_ENABLED=false
-RIPTIDE_API_ORIGIN=https://<api host>
-APP_ORIGIN=https://<app host>
-CLOUD_ORIGIN=https://<admin host>
+RIPTIDE_API_ORIGIN=https://<base>-api.<domain>
+APP_ORIGIN=https://<base>.<domain>
+CLOUD_ORIGIN=https://<base>-admin.<domain>
 WORKOS_CLIENT_ID=<yours>
 WORKOS_API_KEY=<yours>
-WORKOS_REDIRECT_URI=https://<app host>/auth/callback
+WORKOS_REDIRECT_URI=https://<base>.<domain>/auth/callback
 S3_ARTIFACTS_BUCKET=<bucket name>
 S3_ARTIFACTS_REGION=auto
 S3_ARTIFACTS_ENDPOINT=<bucket endpoint>
@@ -125,7 +212,16 @@ RIPTIDE_DAEMON_TOKEN_PRIVATE_KEY=<base64 of PKCS#8 PEM>
 RIPTIDE_DAEMON_TOKEN_PUBLIC_KEY=<base64 of SPKI PEM>
 ```
 
-Generate the daemon token keys:
+Optional:
+
+```
+ALLOWED_EMAIL_DOMAINS=example.com               # comma-separated; unset allows everyone
+OPENROUTER_API_KEY=<yours>                       # or ANTHROPIC_API_KEY
+OPENROUTER_MODEL_SONNET=anthropic/claude-sonnet-5
+OPENROUTER_MODEL_HAIKU=anthropic/claude-haiku-4.5
+```
+
+Daemon token keys, one pair per environment:
 
 ```bash
 openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out daemon-private.pem
@@ -143,29 +239,13 @@ RESEND_API_KEY  RESEND_WEBHOOK_SECRET  RESEND_FROM_EMAIL  RESEND_PRODUCT_USERS_S
 JIRA_CLIENT_ID  JIRA_CLIENT_SECRET  LINEAR_CLIENT_ID  LINEAR_CLIENT_SECRET
 SLACK_CLIENT_ID  SLACK_APP_ID  SLACK_CLIENT_SECRET  SLACK_SIGNING_SECRET
 GITHUB_APP_ID  GITHUB_APP_CLIENT_ID  GITHUB_APP_SLUG  GITHUB_APP_WEBHOOK_SECRET
-GITHUB_APP_PRIVATE_KEY      # must be a real PKCS#8 RSA PEM, even if throwaway
+GITHUB_APP_PRIVATE_KEY      # must be a real PKCS#8 RSA PEM, even a throwaway one
 EXA_API_KEY  CONTEXT7_API_KEY
 ```
 
-Leave `OPENAI_API_KEY`, `SENTRY_DSN` and `POSTHOG_API_KEY` unset.
+Leave `OPENAI_API_KEY`, `SENTRY_DSN` and `POSTHOG_API_KEY` unset. Set the health check path to `/health`.
 
-### Server-side models through OpenRouter
-
-This branch adds `packages/ai/src/providers/primary-models.ts`. When `OPENROUTER_API_KEY` is set on `api`, titles, summaries and research go through OpenRouter. Without it, the code uses `ANTHROPIC_API_KEY` as before.
-
-```
-OPENROUTER_API_KEY=<yours>
-OPENROUTER_MODEL_SONNET=anthropic/claude-sonnet-4.5          # optional overrides
-OPENROUTER_MODEL_HAIKU=anthropic/claude-haiku-4.5
-OPENROUTER_FALLBACK_MODEL_SONNET=openai/gpt-5
-OPENROUTER_FALLBACK_MODEL_HAIKU=openai/gpt-5-mini
-```
-
-This path typechecks and the existing tests pass, but it has not been run against OpenRouter yet. Check the model slugs against OpenRouter's list.
-
-This only affects server-side features. Agent sessions run on each developer's machine with their own Claude Code or Codex login.
-
-### Sync proxy
+### 9. Sync proxy
 
 ```
 RAILWAY_DOCKERFILE_PATH=selfhost/sync.Dockerfile
@@ -181,17 +261,63 @@ WORKOS_REDIRECT_URI=${{api.WORKOS_REDIRECT_URI}}
 RIPTIDE_DAEMON_TOKEN_PUBLIC_KEY=${{api.RIPTIDE_DAEMON_TOKEN_PUBLIC_KEY}}
 ```
 
-## WorkOS
+Health check path: `/`. With a wrong WorkOS client ID it starts but does not answer, because it keeps retrying the key lookup.
 
-From reading the code; not yet verified end to end. Use a dedicated WorkOS environment.
+### 10. Web apps
 
-- AuthKit, with roles `admin`, `manager` and `member`.
-- A JWT template that adds an `internal_org_id` claim from organization metadata. The sync proxy rejects tokens without it.
-- Redirect URIs: `https://<app host>/auth/callback`, `https://<app host>` and `https://<admin host>/auth/callback`. Allow both origins for CORS.
-- Webhook to `https://<api host>/webhooks/workos` for `organization_membership.created`, `.updated` and `.deleted`. Put its signing secret in `WORKOS_WEBHOOK_SECRET`.
-- Device authorization enabled, for `humanlayer login` in the CLI.
+Two services with the same Dockerfile. Railway passes service variables to the build:
 
-## Still to do
+```
+RAILWAY_DOCKERFILE_PATH=selfhost/web.Dockerfile
+APP=riptide-ui                                   # riptide-cloud for the admin app
+VITE_PUBLIC_RIPTIDE_API_ORIGIN=https://<base>-api.<domain>
+VITE_PUBLIC_SYNC_ORIGIN=https://<base>-sync.<domain>
+VITE_PUBLIC_APP_ORIGIN=https://<base>.<domain>
+VITE_PUBLIC_CLOUD_ORIGIN=https://<base>-admin.<domain>
+VITE_PUBLIC_WORKOS_CLIENT_ID=<yours>
+VITE_PUBLIC_DEEP_LINK_SCHEME=<your own scheme>
+PORT=8080
+```
 
-- CLI and daemon build with our own origins (see `.claude/skills/self-host-humanlayer/references/build-config.md`).
-- A real GitHub App.
+### 11. CLI and daemon
+
+The stock `humanlayer` npm package always talks to HumanLayer's servers. Build your own:
+
+```bash
+PROD_BASE=<base> STAGING_BASE=<staging base> DOMAIN=<domain> \
+PROD_WORKOS_CLIENT_ID=<prod client id> STAGING_WORKOS_CLIENT_ID=<staging client id> \
+selfhost/build-cli.sh --all
+```
+
+Binaries land in `apps/cli/dist`. With no staging, use the production values for both. Then, on each developer machine:
+
+```bash
+export HUMANLAYER_RIPTIDE_HOME=$HOME/.humanlayer-selfhost   # keeps this login apart from a stock install
+humanlayer-darwin-arm64 login
+humanlayer-darwin-arm64 daemon launch
+```
+
+Do not use the "Copy start command" button in the app; it gives the stock command.
+
+## Deploying from GitHub
+
+Connect `api`, `sync`, `jobs`, `app` and `admin` to your fork. We run two Railway environments in one project, each with its own database, volumes, bucket and secrets:
+
+- `staging` follows `main`
+- `production` follows a `production` branch
+
+Promoting a change is a fast-forward of `production` to `main`. To take an upstream release: merge `upstream/main` into `main`, let staging deploy, test, then promote.
+
+When you duplicate an environment, give the copy fresh values for `POSTGRES_PASSWORD`, the Redis password, `ELECTRIC_SECRET` and the daemon token keys, and point the API at the new environment's own bucket.
+
+## Things that surprised us
+
+- Railway rejects Dockerfiles with `--mount=type=secret`.
+- Railway cron has a 5-minute minimum.
+- Organization creation needs Stripe upstream, even with billing enforcement off.
+- The API validates its own responses: a placeholder where a Stripe customer ID is expected fails with "Output validation failed".
+- `READ_REPLICA_DATABASE_URL` is required even with one database.
+- `GITHUB_APP_PRIVATE_KEY` must parse as a real PKCS#8 key at startup.
+- A new production WorkOS environment has no sign-in methods enabled.
+- The daemon clones over whatever protocol the project's repository address uses. An SSH address fails on a machine set up for HTTPS.
+- The daemon writes worktrees under `~/.humanlayer` even when `HUMANLAYER_RIPTIDE_HOME` is set; only its login is isolated.
